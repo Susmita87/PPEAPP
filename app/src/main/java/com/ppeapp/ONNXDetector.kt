@@ -6,56 +6,45 @@ import java.nio.FloatBuffer
 import android.graphics.Bitmap
 import androidx.core.graphics.scale
 
+/**
+ * Detector class that leverages the ONNX Runtime to perform PPE detection using a YOLO model.
+ * Intelligent association: Binds PPE detections to the specific person they belong to.
+ */
 class ONNXDetector(context: Context) {
 
-    private var env: OrtEnvironment
-    private var session: OrtSession
+    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private val session: OrtSession
+    private var nextTrackId = 1
+    private val trackedPersons = mutableListOf<Detection>()
 
     init {
-
-        env = OrtEnvironment.getEnvironment()
-
         val modelBytes = context.assets.open("best.onnx").readBytes()
-
-        session = env.createSession(
-            modelBytes,
-            OrtSession.SessionOptions()
-        )
-
-        println("ONNX model loaded successfully")
+        val options = OrtSession.SessionOptions()
+        
+        try {
+            options.addNnapi()
+        } catch (_: Exception) {
+            android.util.Log.w("ONNX", "NNAPI not supported, falling back to CPU")
+        }
+        
+        session = env.createSession(modelBytes, options)
     }
 
-    fun getInputShape(): LongArray {
-
-        val inputInfo = session.inputInfo.values.first()
-
-        return (inputInfo.info as TensorInfo).shape
-    }
-
+    /**
+     * Converts a Bitmap to an OnnxTensor suitable for YOLO input.
+     */
     fun bitmapToTensor(bitmap: Bitmap): OnnxTensor {
-
-        val resized = bitmap.scale(640, 640)
-
+        val resized = if (bitmap.width == 640 && bitmap.height == 640) bitmap else bitmap.scale(640, 640)
         val floatValues = FloatArray(1 * 3 * 640 * 640)
-
         val pixels = IntArray(640 * 640)
 
-        resized.getPixels(
-            pixels,
-            0,
-            640,
-            0,
-            0,
-            640,
-            640
-        )
+        resized.getPixels(pixels, 0, 640, 0, 0, 640, 640)
 
         var rIndex = 0
         var gIndex = 640 * 640
         var bIndex = 2 * 640 * 640
 
         for (pixel in pixels) {
-
             val r = ((pixel shr 16) and 0xFF) / 255f
             val g = ((pixel shr 8) and 0xFF) / 255f
             val b = (pixel and 0xFF) / 255f
@@ -72,122 +61,150 @@ class ONNXDetector(context: Context) {
         )
     }
 
+    /**
+     * Executes the intelligent detection pipeline.
+     * Logic: Detect persons -> Track them -> Crop for detail -> Associate PPE with Person ID.
+     */
     fun detect(bitmap: Bitmap): List<Detection> {
+        // 1. Initial full-frame inference
+        val allDetections = runInference(bitmap)
+        
+        // 2. Identify and track persons
+        val currentPersons = allDetections.filter { it.className == "Person" }
+            .sortedByDescending { (it.x2 - it.x1) * (it.y2 - it.y1) }
+            .take(5)
 
+        for (person in currentPersons) {
+            var assignedId = -1
+            for (tracked in trackedPersons) {
+                if (iou(person, tracked) > 0.5f) {
+                    assignedId = tracked.trackId
+                    break
+                }
+            }
+            if (assignedId == -1) assignedId = nextTrackId++
+            person.trackId = assignedId
+        }
+        
+        trackedPersons.clear()
+        trackedPersons.addAll(currentPersons)
+
+        val results = mutableListOf<Detection>()
+
+        for (person in currentPersons) {
+            results.add(person)
+
+            // 3. Intelligent Association: Crop the person with padding to detect PPE status
+            try {
+                // Add 10% padding to provide model with context (helps fix valid-to-invalid issues)
+                val padW = (person.x2 - person.x1) * 0.1f
+                val padH = (person.y2 - person.y1) * 0.1f
+                
+                val left = (person.x1 - padW).coerceAtLeast(0f)
+                val top = (person.y1 - padH).coerceAtLeast(0f)
+                val right = (person.x2 + padW).coerceAtMost(bitmap.width.toFloat())
+                val bottom = (person.y2 + padH).coerceAtMost(bitmap.height.toFloat())
+
+                if ((right - left) < 20 || (bottom - top) < 20) continue
+
+                val crop = Bitmap.createBitmap(
+                    bitmap, 
+                    left.toInt(), 
+                    top.toInt(), 
+                    (right - left).toInt(), 
+                    (bottom - top).toInt()
+                )
+                
+                val ppeResults = runInference(crop)
+
+                // 4. Map PPE detections back to global coordinates and bind to Person ID
+                for (ppe in ppeResults) {
+                    // Only bind classes related to PPE or violations
+                    if (ppe.className.contains("Hardhat") || 
+                        ppe.className.contains("Vest") || 
+                        ppe.className.contains("Mask")) {
+                        
+                        results.add(ppe.copy(
+                            trackId = person.trackId, // Intelligence: PPE inherits Person ID
+                            x1 = ppe.x1 + left,
+                            y1 = ppe.y1 + top,
+                            x2 = ppe.x2 + left,
+                            y2 = ppe.y2 + top
+                        ))
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        // Add non-person/non-PPE objects from the first pass (e.g., vehicles, cones)
+        val others = allDetections.filter { 
+            it.className != "Person" && 
+            !it.className.contains("Hardhat") && 
+            !it.className.contains("Vest") && 
+            !it.className.contains("Mask")
+        }
+        results.addAll(others)
+
+        return results
+    }
+
+    /**
+     * Performs a single inference pass.
+     */
+    private fun runInference(bitmap: Bitmap): List<Detection> {
         val inputTensor = bitmapToTensor(bitmap)
-
-        val outputs = session.run(
-            mapOf(
-                session.inputNames.iterator().next() to inputTensor
-            )
-        )
-
-
+        val outputs = session.run(mapOf(session.inputNames.iterator().next() to inputTensor))
+        
+        @Suppress("UNCHECKED_CAST")
         val output = outputs[0].value as Array<Array<FloatArray>>
-
-        android.util.Log.d(
-            "YOLO_SHAPE",
-            "dim0=${output.size} dim1=${output[0].size} dim2=${output[0][0].size}"
-        )
-
-        android.util.Log.d(
-            "YOLO_SAMPLE",
-            """
-                x=${output[0][0][0]}
-                y=${output[0][1][0]}
-                w=${output[0][2][0]}
-                h=${output[0][3][0]}
-                obj=${output[0][4][0]}
-                class0=${output[0][5][0]}
-                class1=${output[0][6][0]}
-                """.trimIndent()
-        )
-
+        
         val detections = mutableListOf<Detection>()
-
         val rows = output[0][0].size
-
-        val labels = listOf(
-            "Hardhat",
-            "Mask",
-            "NO-Hardhat",
-            "NO-Mask",
-            "NO-Safety Vest",
-            "Person",
-            "Safety Cone",
-            "Safety Vest",
-            "machinery",
-            "vehicle"
-        )
+        val labels = listOf("Hardhat", "Mask", "NO-Hardhat", "NO-Mask", "NO-Safety Vest", "Person", "Safety Cone", "Safety Vest", "machinery", "vehicle")
 
         for (i in 0 until rows) {
-
-            val x = output[0][0][i]
-            val y = output[0][1][i]
-            val w = output[0][2][i]
-            val h = output[0][3][i]
-
             var maxClassScore = 0f
             var classId = -1
-
-            val objectConfidence = output[0][4][i]
-
-
-
+            
             for (c in 5 until output[0].size) {
-
-                val classScore = output[0][c][i]
-
-                if (classScore > maxClassScore) {
-                    maxClassScore = classScore
+                val score = output[0][c][i]
+                if (score > maxClassScore) {
+                    maxClassScore = score
                     classId = c - 5
                 }
             }
 
-            android.util.Log.d(
-                "YOLO_RAW",
-                "i=$i class=$classId score=$maxClassScore"
-            )
+            // Confidence threshold
+            if (maxClassScore > 0.4f && classId >= 0) {
+                val x = output[0][0][i]
+                val y = output[0][1][i]
+                val w = output[0][2][i]
+                val h = output[0][3][i]
 
-            if (maxClassScore > 0.3f) {
-                android.util.Log.d(
-                    "YOLO_VALID",
-                    "i=$i class=${labels[classId]} score=$maxClassScore"
-                )
-            }
-
-            val finalConfidence = maxClassScore
-
-            // confidence threshold
-            if (finalConfidence > 0.3f && classId >= 0) {
-
-                val imgW = bitmap.width.toFloat()
-                val imgH = bitmap.height.toFloat()
-
-                val x1 = (x - w / 2f) * imgW
-                val y1 = (y - h / 2f) * imgH
-                val x2 = (x + w / 2f) * imgW
-                val y2 = (y + h / 2f) * imgH
-
-                android.util.Log.d(
-                    "YOLO",
-                    "CLASS=${labels[classId]} CONF=$finalConfidence"
-                )
-
-                detections.add(
-                    Detection(
-                        classId = classId,
-                        className = labels[classId],
-                        confidence = finalConfidence,
-                        x1 = x1,
-                        y1 = y1,
-                        x2 = x2,
-                        y2 = y2
-                    )
-                )
+                detections.add(Detection(
+                    classId = classId,
+                    className = labels[classId],
+                    confidence = maxClassScore,
+                    x1 = (x - w / 2f) * bitmap.width,
+                    y1 = (y - h / 2f) * bitmap.height,
+                    x2 = (x + w / 2f) * bitmap.width,
+                    y2 = (y + h / 2f) * bitmap.height
+                ))
             }
         }
-
         return detections
+    }
+
+    private fun iou(a: Detection, b: Detection): Float {
+        val x1 = maxOf(a.x1, b.x1)
+        val y1 = maxOf(a.y1, b.y1)
+        val x2 = minOf(a.x2, b.x2)
+        val y2 = minOf(a.y2, b.y2)
+        val intersection = maxOf(0f, x2 - x1) * maxOf(0f, y2 - y1)
+        val areaA = (a.x2 - a.x1) * (a.y2 - a.y1)
+        val areaB = (b.x2 - b.x1) * (b.y2 - b.y1)
+        return intersection / (areaA + areaB - intersection + 1e-6f)
     }
 }
