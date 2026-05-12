@@ -68,6 +68,7 @@ class ONNXDetector(context: Context) {
     fun detect(bitmap: Bitmap): List<Detection> {
         // 1. Initial full-frame inference
         val allDetections = runInference(bitmap)
+        android.util.Log.d("PPE_DETECTOR", "Raw detections: ${allDetections.size}")
         
         // 2. Identify and track persons
         val currentPersons = allDetections.filter { it.className == "Person" }
@@ -90,13 +91,13 @@ class ONNXDetector(context: Context) {
         trackedPersons.addAll(currentPersons)
 
         val results = mutableListOf<Detection>()
+        results.addAll(allDetections) // Add everything by default first
 
         for (person in currentPersons) {
-            results.add(person)
+            // results.add(person) // Already added via allDetections
 
             // 3. Intelligent Association: Crop the person with padding to detect PPE status
             try {
-                // Add 10% padding to provide model with context (helps fix valid-to-invalid issues)
                 val padW = (person.x2 - person.x1) * 0.1f
                 val padH = (person.y2 - person.y1) * 0.1f
                 
@@ -116,16 +117,16 @@ class ONNXDetector(context: Context) {
                 )
                 
                 val ppeResults = runInference(crop)
+                android.util.Log.d("PPE_DETECTOR", "PPE results for person ${person.trackId}: ${ppeResults.size}")
 
                 // 4. Map PPE detections back to global coordinates and bind to Person ID
                 for (ppe in ppeResults) {
-                    // Only bind classes related to PPE or violations
                     if (ppe.className.contains("Hardhat") || 
                         ppe.className.contains("Vest") || 
                         ppe.className.contains("Mask")) {
                         
                         results.add(ppe.copy(
-                            trackId = person.trackId, // Intelligence: PPE inherits Person ID
+                            trackId = person.trackId,
                             x1 = ppe.x1 + left,
                             y1 = ppe.y1 + top,
                             x2 = ppe.x2 + left,
@@ -134,18 +135,9 @@ class ONNXDetector(context: Context) {
                     }
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                android.util.Log.e("PPE_DETECTOR", "Error in association: ${e.message}")
             }
         }
-
-        // Add non-person/non-PPE objects from the first pass (e.g., vehicles, cones)
-        val others = allDetections.filter { 
-            it.className != "Person" && 
-            !it.className.contains("Hardhat") && 
-            !it.className.contains("Vest") && 
-            !it.className.contains("Mask")
-        }
-        results.addAll(others)
 
         return results
     }
@@ -168,6 +160,9 @@ class ONNXDetector(context: Context) {
             var maxClassScore = 0f
             var classId = -1
             
+            // Standard YOLOv8/v11 output: [1, 4+num_classes, 8400]
+            // Coords at index 0,1,2,3. Class scores start at index 4.
+            // If original code used 5, maybe index 4 was objectness (YOLOv5 style)
             for (c in 5 until output[0].size) {
                 val score = output[0][c][i]
                 if (score > maxClassScore) {
@@ -176,7 +171,6 @@ class ONNXDetector(context: Context) {
                 }
             }
 
-            // Confidence threshold
             if (maxClassScore > 0.4f && classId >= 0) {
                 val x = output[0][0][i]
                 val y = output[0][1][i]
@@ -194,7 +188,27 @@ class ONNXDetector(context: Context) {
                 ))
             }
         }
-        return detections
+        
+        // Very basic NMS to avoid clutter
+        return nms(detections)
+    }
+
+    private fun nms(detections: List<Detection>): List<Detection> {
+        val sorted = detections.sortedByDescending { it.confidence }
+        val selected = mutableListOf<Detection>()
+        val active = BooleanArray(sorted.size) { true }
+        
+        for (i in sorted.indices) {
+            if (active[i]) {
+                selected.add(sorted[i])
+                for (j in i + 1 until sorted.size) {
+                    if (active[j] && iou(sorted[i], sorted[j]) > 0.45f) {
+                        active[j] = false
+                    }
+                }
+            }
+        }
+        return selected
     }
 
     private fun iou(a: Detection, b: Detection): Float {
@@ -206,5 +220,10 @@ class ONNXDetector(context: Context) {
         val areaA = (a.x2 - a.x1) * (a.y2 - a.y1)
         val areaB = (b.x2 - b.x1) * (b.y2 - b.y1)
         return intersection / (areaA + areaB - intersection + 1e-6f)
+    }
+
+    fun onDestroy() {
+        session.close()
+        env.close()
     }
 }

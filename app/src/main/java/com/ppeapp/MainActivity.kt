@@ -32,6 +32,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -43,6 +44,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
+import kotlin.math.min
 
 /**
  * Main Activity of the PPE Detection application.
@@ -53,6 +55,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var detector: ONNXDetector
     private val tracker = Tracker()
     private var cameraProvider: ProcessCameraProvider? = null
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
 
     @ExperimentalGetImage
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -79,6 +82,31 @@ class MainActivity : ComponentActivity() {
                 var isJsonExpanded by remember { mutableStateOf(false) }
                 val coroutineScope = rememberCoroutineScope()
 
+                val previewView = remember {
+                    PreviewView(context).apply {
+                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                        scaleType = PreviewView.ScaleType.FIT_CENTER
+                    }
+                }
+
+                // Ensure the camera analyzer is stopped and pending results are ignored when switching modes
+                val isLiveMode = rememberUpdatedState(liveCamera)
+
+                LaunchedEffect(liveCamera, lensFacing) {
+                    if (liveCamera) {
+                        startCamera(previewView, detector, lensFacing) { result, size ->
+                            if (isLiveMode.value) {
+                                android.util.Log.d("PPE_DEBUG", "Detections: ${result.size}, Size: $size")
+                                detections = result
+                                frameSize = size
+                            }
+                        }
+                    } else {
+                        cameraProvider?.unbindAll()
+                        frameSize = null
+                    }
+                }
+
                 // Launcher for selecting images from device storage
                 val launcher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.GetContent()
@@ -94,10 +122,31 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 bmp?.let { b ->
-                                    bitmap = b
+                                    // Handle EXIF rotation for uploaded images
+                                    val inputStream = context.contentResolver.openInputStream(it)
+                                    val exif = inputStream?.let { stream ->
+                                        try {
+                                            androidx.exifinterface.media.ExifInterface(stream)
+                                        } catch (e: Exception) {
+                                            null
+                                        }
+                                    }
+                                    val orientation = exif?.getAttributeInt(
+                                        androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
+                                        androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
+                                    )
+                                    
+                                    val rotatedBmp = when (orientation) {
+                                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> rotateBitmap(b, 90f)
+                                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> rotateBitmap(b, 180f)
+                                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> rotateBitmap(b, 270f)
+                                        else -> b
+                                    }
+
+                                    bitmap = rotatedBmp
                                     detections = emptyList()
                                     val results = withContext(Dispatchers.Default) {
-                                        detector.detect(b)
+                                        detector.detect(rotatedBmp)
                                     }
                                     detections = results
                                 }
@@ -183,15 +232,28 @@ class MainActivity : ComponentActivity() {
                                 )
 
                                 if (!isProcessing) {
-                                    Canvas(modifier = Modifier.matchParentSize()) {
-                                        val scaleX = size.width / bmp.width
-                                        val scaleY = size.height / bmp.height
+                                    Canvas(
+                                        modifier = Modifier
+                                            .matchParentSize()
+                                            .zIndex(1f)
+                                    ) {
+                                        val canvasRatio = size.width / size.height
+                                        val bmpRatio = bmp.width.toFloat() / bmp.height.toFloat()
+                                        
+                                        val scale = if (bmpRatio > canvasRatio) {
+                                            size.width / bmp.width
+                                        } else {
+                                            size.height / bmp.height
+                                        }
+                                        
+                                        val offsetX = (size.width - bmp.width * scale) / 2
+                                        val offsetY = (size.height - bmp.height * scale) / 2
 
                                         detections.forEach { det ->
-                                            val left = det.x1 * scaleX
-                                            val top = det.y1 * scaleY
-                                            val right = det.x2 * scaleX
-                                            val bottom = det.y2 * scaleY
+                                            val left = det.x1 * scale + offsetX
+                                            val top = det.y1 * scale + offsetY
+                                            val right = det.x2 * scale + offsetX
+                                            val bottom = det.y2 * scale + offsetY
 
                                             drawRect(
                                                 color = if (det.className.contains("NO")) Color.Red else Color.Green,
@@ -216,36 +278,35 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         } else {
-                            val previewView = remember {
-                                PreviewView(this@MainActivity).apply {
-                                    implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                                }
-                            }
-
-                            LaunchedEffect(liveCamera, lensFacing) {
-                                if (liveCamera) {
-                                    startCamera(previewView, detector, lensFacing) { result, size ->
-                                        detections = result
-                                        frameSize = size
-                                    }
-                                }
-                            }
-
                             AndroidView(
                                 factory = { previewView },
                                 modifier = Modifier.matchParentSize()
                             )
 
-                            Canvas(modifier = Modifier.matchParentSize()) {
+                            Canvas(
+                                modifier = Modifier
+                                    .matchParentSize()
+                                    .zIndex(1f)
+                            ) {
                                 frameSize?.let { fSize ->
-                                    val scaleX = size.width / fSize.width
-                                    val scaleY = size.height / fSize.height
+                                    // Calculate scaling to match FIT_CENTER
+                                    val canvasRatio = size.width / size.height
+                                    val frameRatio = fSize.width / fSize.height
+                                    
+                                    val scale = if (frameRatio > canvasRatio) {
+                                        size.width / fSize.width
+                                    } else {
+                                        size.height / fSize.height
+                                    }
+                                    
+                                    val offsetX = (size.width - fSize.width * scale) / 2
+                                    val offsetY = (size.height - fSize.height * scale) / 2
 
                                     detections.forEach { det ->
-                                        val left = det.x1 * scaleX
-                                        val top = det.y1 * scaleY
-                                        val right = det.x2 * scaleX
-                                        val bottom = det.y2 * scaleY
+                                        val left = det.x1 * scale + offsetX
+                                        val top = det.y1 * scale + offsetY
+                                        val right = det.x2 * scale + offsetX
+                                        val bottom = det.y2 * scale + offsetY
 
                                         drawRect(
                                             color = if (det.className.contains("NO")) Color.Red else Color.Green,
@@ -345,6 +406,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        val matrix = android.graphics.Matrix()
+        matrix.postRotate(degrees)
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
     /**
      * Configures and starts the CameraX camera feed with image analysis for PPE detection.
      */
@@ -369,28 +436,40 @@ class MainActivity : ComponentActivity() {
 
             var lastInferenceTime = 0L
 
-            imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
+            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
                 val currentTime = System.currentTimeMillis()
-                // Reduced delay to 200ms to improve responsiveness with NNAPI acceleration
                 if (currentTime - lastInferenceTime < 200) {
                     imageProxy.close()
                     return@setAnalyzer
                 }
 
                 lastInferenceTime = currentTime
-                val mediaImage = imageProxy.image
-
-                if (mediaImage != null) {
-                    try {
-                        val bitmap = mediaImageToBitmap(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                        val results = detector.detect(bitmap)
-                        val tracked = tracker.update(results)
-                        onDetection(tracked, Size(bitmap.width.toFloat(), bitmap.height.toFloat()))
-                    } catch (e: Exception) {
-                        android.util.Log.e("CAMERA_DETECT", e.stackTraceToString())
+                
+                try {
+                    // Get bitmap from ImageProxy
+                    var bitmap = imageProxy.toBitmap()
+                    
+                    // Rotate bitmap to match display orientation if needed
+                    val rotation = imageProxy.imageInfo.rotationDegrees
+                    if (rotation != 0) {
+                        val matrix = android.graphics.Matrix()
+                        matrix.postRotate(rotation.toFloat())
+                        bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
                     }
+                    
+                    val results = detector.detect(bitmap)
+                    val tracked = tracker.update(results)
+                    
+                    val currentSize = Size(bitmap.width.toFloat(), bitmap.height.toFloat())
+                    
+                    ContextCompat.getMainExecutor(this@MainActivity).execute {
+                        onDetection(tracked, currentSize)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("CAMERA_DETECT", "Error in analyzer: ${e.message}")
+                } finally {
+                    imageProxy.close()
                 }
-                imageProxy.close()
             }
 
             val cameraSelector = CameraSelector.Builder()
@@ -451,5 +530,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         cameraProvider?.unbindAll()
+        cameraExecutor.shutdown()
+        detector.onDestroy()
     }
 }
