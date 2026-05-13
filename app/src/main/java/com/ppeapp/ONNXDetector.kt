@@ -18,7 +18,7 @@ class ONNXDetector(context: Context) {
     private val trackedPersons = mutableListOf<Detection>()
 
     init {
-        val modelBytes = context.assets.open("best.onnx").readBytes()
+        val modelBytes = context.assets.open("best-stage2-v8.onnx").readBytes()
         val options = OrtSession.SessionOptions()
         
         try {
@@ -160,22 +160,22 @@ class ONNXDetector(context: Context) {
             var maxClassScore = 0f
             var classId = -1
             
-            // Standard YOLOv8/v11 output: [1, 4+num_classes, 8400]
-            // Coords at index 0,1,2,3. Class scores start at index 4.
-            // If original code used 5, maybe index 4 was objectness (YOLOv5 style)
-            for (c in 5 until output[0].size) {
+            // Standard YOLOv8 output: coordinates in [0, 1, 2, 3], classes starting from index 4
+            for (c in 4 until output[0].size) {
                 val score = output[0][c][i]
                 if (score > maxClassScore) {
                     maxClassScore = score
-                    classId = c - 5
+                    classId = c - 4
                 }
             }
 
-            if (maxClassScore > 0.4f && classId >= 0) {
-                val x = output[0][0][i]
-                val y = output[0][1][i]
-                val w = output[0][2][i]
-                val h = output[0][3][i]
+            if (maxClassScore > 0.4f && classId >= 0 && classId < labels.size) {
+                // YOLOv8 output coordinates are typically in pixels relative to the model input (640x640)
+                // We need to normalize them (divide by 640) before scaling to the original bitmap size
+                val x = output[0][0][i] / 640f
+                val y = output[0][1][i] / 640f
+                val w = output[0][2][i] / 640f
+                val h = output[0][3][i] / 640f
 
                 detections.add(Detection(
                     classId = classId,
