@@ -18,7 +18,7 @@ class ONNXDetector(context: Context) {
     private val trackedPersons = mutableListOf<Detection>()
 
     init {
-        val modelBytes = context.assets.open("best-stage2-v8.onnx").readBytes()
+        val modelBytes = context.assets.open("best-stage2.onnx").readBytes()
         val options = OrtSession.SessionOptions()
         
         try {

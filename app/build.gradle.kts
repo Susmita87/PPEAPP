@@ -12,7 +12,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.ppeapp.yollo8.v2"
+        applicationId = "com.ppeapp.yollo11.v1"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
@@ -42,7 +42,7 @@ android {
 androidComponents {
     onVariants { variant ->
         variant.outputs.forEach { output ->
-            output.outputFileName.set("PPE_YOLO8_ONNX_v2.0.apk")
+            output.outputFileName.set("PPE_YOLO11_ONNX_v1.0.apk")
         }
     }
 }
