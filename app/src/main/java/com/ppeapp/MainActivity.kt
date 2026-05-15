@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -39,12 +40,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.unit.sp
 import com.ppeapp.ui.theme.PPEAndroidAppTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import android.os.Environment
 import java.util.concurrent.Executors
 import kotlin.math.min
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 
 /**
  * Main Activity of the PPE Detection application.
@@ -56,6 +63,7 @@ class MainActivity : ComponentActivity() {
     private val tracker = Tracker()
     private var cameraProvider: ProcessCameraProvider? = null
     private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val lastSavedViolations = mutableMapOf<Int, Long>()
 
     @ExperimentalGetImage
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,6 +90,13 @@ class MainActivity : ComponentActivity() {
                 var isJsonExpanded by remember { mutableStateOf(false) }
                 val coroutineScope = rememberCoroutineScope()
 
+                // Database setup
+                val db = remember { AppDatabase.getDatabase(context) }
+                val violationDao = db.violationDao()
+                val violations by violationDao.getAllViolations().collectAsState(initial = emptyList())
+                var showDashboard by remember { mutableStateOf(false) }
+                var saveImagesEnabled by remember { mutableStateOf(false) }
+
                 val previewView = remember {
                     PreviewView(context).apply {
                         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
@@ -94,9 +109,25 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(liveCamera, lensFacing) {
                     if (liveCamera) {
-                        startCamera(previewView, detector, lensFacing) { result, size ->
+                        lastSavedViolations.clear() // Reset cooldowns when starting camera
+                        startCamera(
+                            previewView,
+                            detector,
+                            lensFacing,
+                            onViolation = { det, bmp ->
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    val path = if (saveImagesEnabled) saveViolationImage(bmp, det.className) else ""
+                                    violationDao.insert(ViolationRecord(
+                                        type = det.className,
+                                        timestamp = System.currentTimeMillis(),
+                                        confidence = det.confidence,
+                                        imagePath = path,
+                                        trackId = det.trackId
+                                    ))
+                                }
+                            }
+                        ) { result, size ->
                             if (isLiveMode.value) {
-                                android.util.Log.d("PPE_DEBUG", "Detections: ${result.size}, Size: $size")
                                 detections = result
                                 frameSize = size
                             }
@@ -149,6 +180,25 @@ class MainActivity : ComponentActivity() {
                                         detector.detect(rotatedBmp)
                                     }
                                     detections = results
+
+                                    // Save any violations found in the uploaded image
+                                    results.forEach { det ->
+                                        if (det.className.contains("NO-")) {
+                                            coroutineScope.launch(Dispatchers.IO) {
+                                                val path = if (saveImagesEnabled) {
+                                                    saveViolationImage(rotatedBmp, det.className)
+                                                } else ""
+                                                
+                                                violationDao.insert(ViolationRecord(
+                                                    type = det.className,
+                                                    timestamp = System.currentTimeMillis(),
+                                                    confidence = det.confidence,
+                                                    imagePath = path,
+                                                    trackId = det.trackId
+                                                ))
+                                            }
+                                        }
+                                    }
                                 }
                             } catch (e: Exception) {
                                 e.printStackTrace()
@@ -168,46 +218,65 @@ class MainActivity : ComponentActivity() {
                     // Control row with buttons for Upload, Live Camera, and Switching Lens
                     Row(
                         modifier = Modifier.fillMaxWidth().zIndex(1f),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Button(
-                            onClick = {
-                                detections = emptyList()
-                                liveCamera = false
-                                launcher.launch("image/*")
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Upload")
+                        if (!liveCamera) {
+                            // Default Mode Buttons
+                            Button(
+                                onClick = {
+                                    detections = emptyList()
+                                    liveCamera = false
+                                    launcher.launch("image/*")
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Upload", maxLines = 1)
+                            }
+
+                            Button(
+                                onClick = {
+                                    detections = emptyList()
+                                    liveCamera = true
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Live", maxLines = 1)
+                            }
+                        } else {
+                            // Live Mode Buttons
+                            Button(
+                                onClick = {
+                                    liveCamera = false
+                                    detections = emptyList()
+                                    bitmap = null
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                            ) {
+                                Text("Off", color = Color.White, maxLines = 1)
+                            }
+
+                            Button(
+                                onClick = {
+                                    detections = emptyList()
+                                    lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+                                        CameraSelector.LENS_FACING_FRONT
+                                    } else {
+                                        CameraSelector.LENS_FACING_BACK
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Switch", maxLines = 1)
+                            }
                         }
 
-                        Spacer(modifier = Modifier.width(8.dp))
-
                         Button(
-                            onClick = {
-                                detections = emptyList()
-                                liveCamera = true
-                            },
+                            onClick = { showDashboard = true },
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Live")
-                        }
-
-                        Spacer(modifier = Modifier.width(8.dp))
-
-                        Button(
-                            onClick = {
-                                detections = emptyList()
-                                lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
-                                    CameraSelector.LENS_FACING_FRONT
-                                } else {
-                                    CameraSelector.LENS_FACING_BACK
-                                }
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Switch")
+                            Text("Stats", maxLines = 1)
                         }
                     }
 
@@ -353,18 +422,30 @@ class MainActivity : ComponentActivity() {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { isJsonExpanded = !isJsonExpanded }
                             .padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = if (isJsonExpanded) "▼ Detection Results (JSON)" else "▶ Detection Results (JSON)",
-                            color = Color.Gray,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Text(
-                            text = if (isJsonExpanded) "Minimize" else "Maximize",
-                            color = Color(0xFF9CDCFE)
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { isJsonExpanded = !isJsonExpanded },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (isJsonExpanded) "▼ JSON" else "▶ JSON",
+                                color = Color.Gray
+                            )
+                        }
+
+                        Text("Save Images", color = Color.Gray, fontSize = 12.sp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = saveImagesEnabled,
+                            onCheckedChange = { saveImagesEnabled = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.Green,
+                                checkedTrackColor = Color.Green.copy(alpha = 0.5f)
+                            )
                         )
                     }
 
@@ -402,7 +483,41 @@ class MainActivity : ComponentActivity() {
                         Spacer(modifier = Modifier.weight(1f))
                     }
                 }
+
+                if (showDashboard) {
+                    ViolationDashboard(
+                        violations = violations,
+                        onClose = { showDashboard = false },
+                        onDeleteOld = {
+                            coroutineScope.launch(Dispatchers.IO) {
+                                val threshold = System.currentTimeMillis() - 24 * 60 * 60 * 1000
+                                // Delete images then records
+                                violationDao.getOldImagePaths(threshold).forEach { path ->
+                                    if (path.isNotEmpty()) {
+                                        val file = File(path)
+                                        if (file.exists()) file.delete()
+                                    }
+                                }
+                                violationDao.deleteOldViolations(threshold)
+                            }
+                        }
+                    )
+                }
             }
+        }
+    }
+
+    private fun saveViolationImage(bitmap: Bitmap, type: String): String {
+        val fileName = "violation_${System.currentTimeMillis()}.jpg"
+        val storageDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+        val file = File(storageDir, fileName)
+        return try {
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            }
+            file.absolutePath
+        } catch (e: Exception) {
+            ""
         }
     }
 
@@ -412,14 +527,12 @@ class MainActivity : ComponentActivity() {
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
-    /**
-     * Configures and starts the CameraX camera feed with image analysis for PPE detection.
-     */
     @ExperimentalGetImage
     private fun startCamera(
         previewView: PreviewView,
         detector: ONNXDetector,
         lensFacing: Int,
+        onViolation: (Detection, Bitmap) -> Unit,
         onDetection: (List<Detection>, Size) -> Unit
     ) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -459,6 +572,20 @@ class MainActivity : ComponentActivity() {
                     
                     val results = detector.detect(bitmap)
                     val tracked = tracker.update(results)
+                    
+                    // Intelligent violation recording logic
+                    tracked.forEach { det ->
+                        if (det.className.contains("NO-")) {
+                            val now = System.currentTimeMillis()
+                            val lastSave = lastSavedViolations[det.trackId] ?: 0L
+                            
+                            // 15-second cooldown per track ID to avoid spamming the database
+                            if (now - lastSave > 15000) {
+                                lastSavedViolations[det.trackId] = now
+                                onViolation(det, bitmap)
+                            }
+                        }
+                    }
                     
                     val currentSize = Size(bitmap.width.toFloat(), bitmap.height.toFloat())
                     
